@@ -1,0 +1,5 @@
+# Global ignores
+.DS_Store
+.vscode/
+.idea/
+scratch/
