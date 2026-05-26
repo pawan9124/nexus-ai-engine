@@ -27,7 +27,7 @@ function App() {
   const generateNewId = () => 'chat_' + Math.random().toString(36).substring(2, 9);
   const [sessionId, setSessionId] = useState(generateNewId());
 
-  const API_GATEWAY = 'http://localhost:5000/api/documents';
+  const API_GATEWAY = "https://nexus-ai-engine-24tb.onrender.com/api/documents";
 
   // --- NEW: Fetch all sessions on load ---
   useEffect(() => {
@@ -153,7 +153,7 @@ function App() {
 
     try {
       //Note: The Auth routes are on port 5000 directly. adjust URL if needed
-      const res = await axios.post(`http://localhost:5000${endpoint}`, authForm);
+      const res = await axios.post(`https://nexus-ai-engine-24tb.onrender.com${endpoint}`, authForm);
       if (authMode === 'login') {
         const { token, username } = res.data;
         localStorage.setItem('token', token);
@@ -347,8 +347,8 @@ function App() {
               chatHistory.map((msg, index) => (
                 <div key={index} className={`flex w-full ${msg.type === 'user' ? 'justify-end' : 'justify-start'}`}>
                   <div className={`max-w-[80%] p-4 text-[15px] leading-relaxed ${msg.type === 'user'
-                      ? 'bg-indigo-600 text-white rounded-2xl rounded-tr-sm shadow-md'
-                      : 'bg-white/5 text-slate-200 rounded-2xl rounded-tl-sm border border-white/5'
+                    ? 'bg-indigo-600 text-white rounded-2xl rounded-tr-sm shadow-md'
+                    : 'bg-white/5 text-slate-200 rounded-2xl rounded-tl-sm border border-white/5'
                     }`}>
                     {msg.text}
                   </div>
