@@ -189,6 +189,9 @@ async def get_session_history(session_id:str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get('/api/health')
+async def health_check():
+    return {"status": "AI Brain is awake"}
 
 if __name__ == "__main__":
     import uvicorn

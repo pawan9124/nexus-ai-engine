@@ -29,6 +29,14 @@ function App() {
 
   const API_GATEWAY = "https://nexus-ai-engine-24tb.onrender.com/api/documents";
 
+  // --- SILENT WARM-UP PING ---
+  useEffect(() => {
+    // We don't await this, and we don't care about the response.
+    // We just want to knock on the server's door.
+    axios.get('https://nexus-ai-engine-24tb.onrender.com/api/health')
+      .catch((err) => console.log("Server waking up ...."));
+  }, [])
+
   // --- NEW: Fetch all sessions on load ---
   useEffect(() => {
     fetchAllSessions();

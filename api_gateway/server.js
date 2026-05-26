@@ -226,6 +226,22 @@ app.get('/api/documents/history/:sessionId', authenticationToken, async (req, re
 });
 
 
+//========================================
+// ---------- WARM UP PING ROUTE --------
+//========================================
+
+app.get("/api/health", async (req, res) => {
+    try {
+        // Ping Python to wake it up simultaneously
+        await axios.get(`${PYTHON_AI_URL}/api/health`);
+        res.json({ status: "Gateway and Brain are awake" });
+    } catch (error) {
+        //Even if Python times out on the first ping, the container is still waking up! 
+        res.status(202).json({ status: "Waking up..." })
+    }
+})
+
+
 //Start the server
 app.listen(PORT, () => {
     console.log(` Node.js API Gateway running on http//localhost: ${PORT}`);
