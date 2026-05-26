@@ -15,7 +15,7 @@ const app = express()
 const PORT = 5000
 
 // The internal URL of your Python AI Microservice
-const PYTHON_AI_URL = 'http://127.0.0.1:8000'
+const PYTHON_AI_URL = process.env.PYTHON_AI_URL;
 
 //  --- MIDDLEWARE ----
 app.use(cors());
