@@ -198,7 +198,7 @@ app.post("/api/documents/chat", authenticationToken, async (req, res) => {
 // 4. Get all Session IDs
 app.get("/api/documents/sessions", authenticationToken, async (req, res) => {
     try {
-        const pythonResponse = await axios.get(`${PYTHON_AI_URL}/api/sessions/`, {
+        const pythonResponse = await axios.get(`${PYTHON_AI_URL}/api/sessions`, {
             headers: {
                 Authorization: req.headers.authorization
             }

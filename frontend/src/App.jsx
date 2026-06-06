@@ -10,6 +10,7 @@ function App() {
   const [chatHistory, setChatHistory] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isFetchingHistory, setIsFetchingHistory] = useState(false);
+  const [isFetchingSessions, setIsFetchingSessions] = useState(false);
 
   //tokens and authentications
   const [token, setToken] = useState(localStorage.getItem('token') || null);
@@ -27,13 +28,14 @@ function App() {
   const generateNewId = () => 'chat_' + Math.random().toString(36).substring(2, 9);
   const [sessionId, setSessionId] = useState(generateNewId());
 
-  const API_GATEWAY = "https://nexus-ai-engine-24tb.onrender.com/api/documents";
+  const API_BASE = 'http://localhost:5000'; // Must point to Node.js API Gateway, not Python
+  const API_GATEWAY = `${API_BASE}/api/documents`;
 
   // --- SILENT WARM-UP PING ---
   useEffect(() => {
     // We don't await this, and we don't care about the response.
     // We just want to knock on the server's door.
-    axios.get('https://nexus-ai-engine-24tb.onrender.com/api/health')
+    axios.get(`${API_BASE}/api/health`)
       .catch((err) => console.log("Server waking up ...."));
   }, [])
 
@@ -43,6 +45,7 @@ function App() {
   }, []);
 
   const fetchAllSessions = async () => {
+    setIsFetchingSessions(true);
     try {
       const res = await axios.get(`${API_GATEWAY}/sessions`, {
         headers: {
@@ -52,6 +55,8 @@ function App() {
       setPastSessions(res.data.sessions || []);
     } catch (error) {
       console.error("Failed to fetch sessions", error);
+    } finally {
+      setIsFetchingSessions(false);
     }
   };
 
@@ -161,7 +166,7 @@ function App() {
 
     try {
       //Note: The Auth routes are on port 5000 directly. adjust URL if needed
-      const res = await axios.post(`https://nexus-ai-engine-24tb.onrender.com${endpoint}`, authForm);
+      const res = await axios.post(`${API_BASE}${endpoint}`, authForm);
       if (authMode === 'login') {
         const { token, username } = res.data;
         localStorage.setItem('token', token);
@@ -272,16 +277,24 @@ function App() {
 
         <div className="flex-1 overflow-y-auto px-3 pb-4 flex flex-col gap-1 custom-scrollbar">
           <p className="px-3 py-2 text-xs font-semibold text-slate-500 uppercase tracking-wider">Session Archives</p>
-          {pastSessions.map((id) => (
-            <button
-              key={id}
-              onClick={() => loadSession(id)}
-              className={`p-3 text-left rounded-xl text-sm flex items-center gap-3 truncate transition-all duration-200 border ${sessionId === id ? 'bg-indigo-500/10 text-indigo-300 border-indigo-500/20 shadow-sm' : 'border-transparent text-slate-400 hover:bg-white/5 hover:text-slate-200'}`}
-            >
-              <MessageCircle className={`w-4 h-4 shrink-0 ${sessionId === id ? 'text-indigo-400' : 'text-slate-500'}`} />
-              {id}
-            </button>
-          ))}
+          {isFetchingSessions ? (
+            <div className="flex justify-center items-center py-4">
+              <Loader2 className="animate-spin w-5 h-5 text-indigo-500" />
+            </div>
+          ) : pastSessions.length === 0 ? (
+            <div className="px-3 py-2 text-xs text-slate-500 italic">No past sessions</div>
+          ) : (
+            pastSessions.map((id) => (
+              <button
+                key={id}
+                onClick={() => loadSession(id)}
+                className={`p-3 text-left rounded-xl text-sm flex items-center gap-3 truncate transition-all duration-200 border ${sessionId === id ? 'bg-indigo-500/10 text-indigo-300 border-indigo-500/20 shadow-sm' : 'border-transparent text-slate-400 hover:bg-white/5 hover:text-slate-200'}`}
+              >
+                <MessageCircle className={`w-4 h-4 shrink-0 ${sessionId === id ? 'text-indigo-400' : 'text-slate-500'}`} />
+                {id}
+              </button>
+            ))
+          )}
         </div>
 
         <div className="p-4 border-t border-white/5 bg-[#151822] mt-auto">
