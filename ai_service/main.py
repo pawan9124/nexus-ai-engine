@@ -8,9 +8,9 @@ from langchain_mongodb.vectorstores import MongoDBAtlasVectorSearch
 from langchain_mongodb.chat_message_histories import MongoDBChatMessageHistory
 from langchain_core.documents import Document
 from langgraph.graph import END, StateGraph
-from langchai_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_retriever import EnsembleRetriever
+from langchain_classic.retrievers import EnsembleRetriever
 from langchain_community.retrievers import BM25Retriever
 from pymongo import MongoClient
 from dotenv import load_dotenv
@@ -60,7 +60,7 @@ embeddings_model =  GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-
 
 # The LLM (For acutally talking/answering)
 # We use gemini-2.5-flahs because it is lightning fast for RAG
-llm = ChatGoogleGenerativeAI(model='gemini-2.5-flash', temperature=0)
+llm = ChatGoogleGenerativeAI(model='gemma-4-31b-it', temperature=0)
 
 # THE 2026 UPGRADE: Using the official LangCHain MongoDB vector Store abstraction 
 # This will replace the $vector Search we are introducing before
@@ -81,7 +81,8 @@ class GraphState(TypedDict):
     generation: str # The Final AI answer
     documents: List[Document] # The context pulled from MongodDB
     loop_count: int # To prevent infinite loops (cut off after 3 tries)
-    allowed_tiers: List[str] # NEW: The Role based security badge
+    allowed_tiers: List[str]
+    session_id:str # NEW: The Role based security badge,
 
 # Define the strict JSON schema we ewanat the LLM to putput
 class GradeDocuments(BaseModel):
@@ -90,37 +91,7 @@ class GradeDocuments(BaseModel):
     """
     binary_score: str = Field(description="Documents are relevant to the question, 'yes' or 'no'")
 
-# 1. Initialize the Graph with out State
-workflow = StateGraph(GraphState)
 
-# 2. Define the "Nodes" (The Physical funtions the AI can execute)
-workflow.add_node("retrieve", retrieve_node) # fetches from MongoDB
-workflow.add_node('grade_documents', grade_node) # checks if docs are relevant 
-workflow.add_node("generate", generate_node) #Streams the final answer
-workflow.add_node("rewrite_query", rewrite_node) # Improves the seach query
-
-# 3. Define the "Edges" (How the AI moves from node to node)
-workflow.set_entry_point("retrieve")
-workflow.add_edge("retrieve", "grade_documents")
-
-# 4. The conditional Edge (The "Thinking" Phase)
-# If documents are good -> go to Generate. If bad -> go to Rewrite.
-
-workflow.add_conditional_edges(
-    "grade_documents",
-    decide_to_generate,
-    {
-        "generate": "generate",
-        "rewrite": "rewrite_query"
-    }
-)
-
-# If it rewrites, it MUST loop back to retreive new documents
-workflow.add_edge("rewrite_query", "retrieve")
-workflow.add_edge("generate", END)
-
-# Compile the Graph!
-app_brain  = workflow.compile()
 
 #-----------------------------------
     # Reranking setting for the  Hybrid Search combines both algorithms 
@@ -131,11 +102,37 @@ app_brain  = workflow.compile()
 # (We do this once when the server starts)
 
 print(" BUilding BM25 Keyword Index in memory....")
-all_docs_cursor =  vector_store.collection.find({},{"text":1})
-all_documents = [Document(page_content=doc["text"]) for doc in all_docs_cursor if "text" in doc]
+all_docs_cursor =  vector_store.collection.find({},{"text":1, "session_id":1, "metadata":1})
+all_documents = []
 
-# Initialize the exact-match Keyword Retriever
-keyword_retriever = BM25Retriever.from_documents(all_documents)
+for doc in all_docs_cursor:
+    if 'text' in doc:
+        #Reconstruct the metadata dictionary safely
+        doc_metadata = doc.get('metadata',{})
+
+        #Attach the session_id directly into the metadata so BM25 can read it later
+        doc_metadata["session_id"] = doc.get('session_id')
+
+        # Create the LangChain DOcument object
+        all_documents.append(Document(
+            page_content=doc['text'],
+            metadata=doc_metadata
+        ))
+print("All documents length:", len(all_documents))
+print("all_documents:",all_documents)
+
+# FIX: Protect against an empty database crash!
+if len(all_documents) == 0:
+    print(" WARNING: Database is empty! Initializing BM25 with placeholder")
+    # We feed a single fake document just so the math engine doesn't crash
+    dummy_doc = Document(
+        page_content="system initialization placeholder empty document",
+        metadata={"security_tier": "PUBLIC", "session_id": "dummy"}
+    )
+    keyword_retriever = BM25Retriever.from_documents([dummy_doc])
+else:
+    keyword_retriever = BM25Retriever.from_documents(all_documents)
+
 keyword_retriever.k = 3 # Return the top  3 keyword matches
 
 # Setup your existing Vector Retriever
@@ -143,7 +140,7 @@ vector_retriever = vector_store.as_retriever(search_kwargs={"k":3})
 
 # THE MAGIC: Combine them into  a Hybrid Retriever using RRF
 hybrid_retriever = EnsembleRetriever(
-    retriever=[keyword_retriever, vector_retriever],
+    retrievers=[keyword_retriever, vector_retriever],
     weights=[0.5,0.5] # 50% keyword, 50% vector
 )
 
@@ -198,7 +195,16 @@ async def determine_intent_with_llm(question: str, formatted_history: str, llm_i
 
     # Use standard invocation for a fast, single-word token return
     response = await llm_instance.ainvoke(router_prompt)
-    intent = response.content.strip().upper()
+    raw_content = response.content
+
+    # DEFENSIVE PARSING: Handle Gemma's list format safely
+    if isinstance(raw_content, list):
+        #Extract the text string out of the first dictionary in the list
+        intent_text = raw_content[0].get('text','')
+        intent = intent_text.strip().upper()
+    else:
+        #If it's standard Gemini string, just strip it normally
+        intent = raw_content.strip().upper()
 
     if intent in ["VECTOR_RAG", "GENERIC_CHAT", "MATH"]:
         return intent
@@ -304,7 +310,7 @@ async def check_security_threat(question: str, threshold: float=0.85)->bool:
 # ---------------- LANGGRAPH STATE DEFINITION ----------------
 
 # ---------- WORKER A: THE RETRIEVE NODE -------------
-async def retrieve_node(state: GraphState)-> GraphState:
+async def retriever_node(state: GraphState)-> GraphState:
     """
     Worker A: Reads the question, runs HYBRID SEARCH (Vector + keywords) and returns the 
     highest ranked documents.
@@ -322,11 +328,17 @@ async def retrieve_node(state: GraphState)-> GraphState:
     # NOw integerate the allowed tiers for the Role based Access to the vectors
 
     allowed_tiers = state.get('allowed_tiers',['PUBLIC'])
+    session_id = state.get("session_id") # Grab the session lock
 
     # The math Shield for Vector Search
-    rbac_filter = {"metadata.security_tier": {"$in": allowed_tiers}}
+    combined_rabc_session_filter = {
+        "$and":[
+            {"metadata.security_tier": {"$in": allowed_tiers}},
+            {"session_id":{"$eq": session_id}}
+        ]
+    }
     secure_vector = vector_store.as_retriever(
-        search_kwargs={"k": 10, "pre_filter": rbac_filter}
+        search_kwargs={"k": 10, "pre_filter": combined_rabc_session_filter}
     )
 
     secure_hybrid = EnsembleRetriever(
@@ -376,42 +388,51 @@ async def grade_node(state: GraphState) -> GraphState:
     question = state['question']
     documents = state['documents']
 
+    # If retrieval failed entirely, fast -failed to rewrite
+
+    if not documents:
+        return { "documents":[]}
+
     # Bind the strict Pydantic schema to your LLM
     structured_llm_grader = llm.with_structured_output(GradeDocuments)
 
-    # The strict grading instructions
+    # NEW Instruction: Grade the batch as a whole 
+    # Since we are now using vector search our retrieval is mathematically precise.
+    # We no longer need to filter individual documents.
+    # We just need to ask the LLM if the retrieved context is sufficient.
     system_prompt = """
-    You are an elite grading system assessing the relevance of a retrieved document to a user question.
-    If the documents contains the keywords, facts, or semantic meaning that help answer the question, grade it 'yes'.
-    If it is completely unrelated garbage, grade it as 'no'.
-    You must outpute ONLY 'yes' or 'no'
+        You are an elite grading system.
+        You will be given a batch of  retrieved document chunks.
+        If ANY of the chunks contain keywords, facts, or semantic meaning that helps answer the user's question, grade the batch 'yes'. 
+        If the entire batch is completely unrelated garbage, grade it 'no'.
+        You must output ONLY 'yes' or 'no'.
      """
 
     grade_prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
-        ("human", "Retreived documents: \n\n {documents} \n\n User question: {question}")
+        ("human", "Retreived documents: \n\n {context} \n\n User question: {question}")
     ])
 
     retrieval_grader = grade_prompt | structured_llm_grader
-    
-    #SCore each documents one by one
-    filtered_docs = []
-    for doc in documents:
-        #Ask the LLM to grade it
-        result = await retrieval_grader.ainvoke({"question": question, "document":doc.page_content})
 
-        if result.binary_score == "yes":
-            filtered_docs.append(doc)
+    # The magic to combine all chunks into one string (Costs $0, takes 0ms)
+    combined_context = "\n\n---\n\n".join([doc.page_content for doc in documents])
+
+    # Ask the LLM to grade the entire batch in exactly ONE API call
+    result  =  await retrieval_grader.ainvoke({
+        "question": question,
+        "context": combined_context
+    })
 
     # Log the results for your terminal observability
-    if len(filtered_docs) > 0:
-        print(f" [NODE: GRADER] Approved {len(filtered_docs)} documents.")
+    if result.binary_score == "yes":
+        print(f" [NODE: GRADER] : Batch Approved! Passing {len(documents)} chunks forward.")
+        return { "documents": documents}
     else:
-        print(f" [NODE: GRADER] All documents rejected. Triggering rewrite loop.")
+        print(f" [NODE: GRADER]  Batch Rejected. Triggering rewrite loop.")
+        return {"documents":[]}
     
 
-    # Overwrite the state documents with ONLY the approved ones
-    return { "documents": filtered_docs}
 
 # --------------- WORKER C: The Rewriter Node --------------
 async def rewrite_node(state: GraphState) -> GraphState:
@@ -431,7 +452,7 @@ async def rewrite_node(state: GraphState) -> GraphState:
     Do NOT answer the question. Just output the improved search query as a plain string
     """
 
-    rewrite_prompt = ChatPromptTemplate.from_message([
+    rewrite_prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
         ('human', "Original question:{question}")
     ])
@@ -488,7 +509,7 @@ async def generate_node(state: GraphState) -> GraphState:
     return {"generation": final_answer}
 
 # --------------- DECIDE TO GENERATE -------------------
-def decide_to_generate(state: StateGraph)-> str:
+def decide_to_generate(state: GraphState)-> str:
     """
     The Traffic cop: Decide where to send the clipboard next.
     """
@@ -515,6 +536,42 @@ def decide_to_generate(state: StateGraph)-> str:
     # If we have good documents left, route to the final Generator Node!
     print(f" [GRAPH] Decision: Documents are good. Routing to Generator.")
     return 'generate'
+
+
+# ========================================================
+#                   BUILD THE LANGGRAPH WORKFLOW
+# ========================================================
+# 1. Initialize the Graph with out State
+workflow = StateGraph(GraphState)
+
+# 2. Define the "Nodes" (The Physical funtions the AI can execute)
+workflow.add_node("retrieve", retriever_node) # fetches from MongoDB
+workflow.add_node('grade_documents', grade_node) # checks if docs are relevant 
+workflow.add_node("generate", generate_node) #Streams the final answer
+workflow.add_node("rewrite_query", rewrite_node) # Improves the seach query
+
+# 3. Define the "Edges" (How the AI moves from node to node)
+workflow.set_entry_point("retrieve")
+workflow.add_edge("retrieve", "grade_documents")
+
+# 4. The conditional Edge (The "Thinking" Phase)
+# If documents are good -> go to Generate. If bad -> go to Rewrite.
+
+workflow.add_conditional_edges(
+    "grade_documents",
+    decide_to_generate,
+    {
+        "generate": "generate",
+        "rewrite": "rewrite_query"
+    }
+)
+
+# If it rewrites, it MUST loop back to retreive new documents
+workflow.add_edge("rewrite_query", "retrieve")
+workflow.add_edge("generate", END)
+
+# Compile the Graph!
+app_brain  = workflow.compile()
 
 
 # Mock Authentication Dependendcy
@@ -552,8 +609,10 @@ async def upload_file(file: UploadFile = File(...), session_id:str = Form(...)):
         chunks = text_splitter.split_documents(raw_documents)
 
         # Attach the session_id in every chunks
+        # Attach the session_id AND the security badge to every chunk
         for chunk in chunks:
             chunk.metadata['session_id'] = session_id
+            chunk.metadata['security_tier'] = "PUBLIC" # 🛡️ The RBAC Default!
 
 
         # THE 2026 UPGRADE: Let the vector store handle the database insertion automatically
@@ -680,7 +739,9 @@ async def chat_with_documents(request: ChatRequest, current_user: dict = Depends
             final_state = await app_brain.ainvoke({
                 "question": request.question,
                 "loop_count":0,
-                "allowed_tiers": allowed_tiers # Injected here!
+                "allowed_tiers": allowed_tiers,
+                "session_id":request.session_id # Injected here!,
+
             })
 
             final_answer = final_state.get("generation", "I'm sorry, I couldn't find an answer.")
