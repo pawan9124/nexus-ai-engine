@@ -15,7 +15,11 @@ from langchain_community.retrievers import BM25Retriever
 from pymongo import MongoClient
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Dict,Any, List, TypedDict
+from langgraph.prebuilt import ToolNode
+from tools import check_billing_status, search_company_documents
+from langchain_core.messages import  BaseMessage, HumanMessage, SystemMessage 
+from langgraph.graph.message import add_messages
+from typing import Dict,Any, List, TypedDict, Annotated, Sequence
 import shutil
 import os
 import re
@@ -60,7 +64,12 @@ embeddings_model =  GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-
 
 # The LLM (For acutally talking/answering)
 # We use gemini-2.5-flahs because it is lightning fast for RAG
-llm = ChatGoogleGenerativeAI(model='gemma-4-31b-it', temperature=0)
+llm = ChatGoogleGenerativeAI(model='gemini-2.5-flash', temperature=0)
+
+# ------------ BINDING FUNCTION TOOLS ----------------
+# For the agent_node we are not passing the search_company_documents to the tool node cause we want the RAG flow to already handle the retrieval of the documents and we want the RAG flow to execute when need to search the documents 
+llm_with_tools = llm.bind_tools([check_billing_status, search_company_documents]) # This bind_tools with llm tell the llm or gemini that these tools exsit in our flow and you can 
+tool_node = ToolNode([check_billing_status]) # This one is used when the lang graph get the request from the llm to use it and then it has to use it.
 
 # THE 2026 UPGRADE: Using the official LangCHain MongoDB vector Store abstraction 
 # This will replace the $vector Search we are introducing before
@@ -83,6 +92,7 @@ class GraphState(TypedDict):
     loop_count: int # To prevent infinite loops (cut off after 3 tries)
     allowed_tiers: List[str]
     session_id:str # NEW: The Role based security badge,
+    messages: Annotated[Sequence[BaseMessage], add_messages] #The add_messages reducer tells Langgraph to APPEND to this list , not overwrite it
 
 # Define the strict JSON schema we ewanat the LLM to putput
 class GradeDocuments(BaseModel):
@@ -537,6 +547,71 @@ def decide_to_generate(state: GraphState)-> str:
     print(f" [GRAPH] Decision: Documents are good. Routing to Generator.")
     return 'generate'
 
+# ------------------ WORKER 0 : THE AGENT NODE (NEW RECEPTIONIST) ----------------------
+async def agent_node(state:GraphState) -> GraphState:
+    """
+    WORKER 0: The Front door. Looks at the question and decides to either:
+    1. Call the Billing API Tool
+    2. Call the Document Search RAG Tool
+    3. Answer the user directly
+    """
+    print(" [NODE:AGENT] Deciding next steps....")
+
+    # Extract messages or initalize if empty
+    messages = state.get('messages',[])
+
+    # ---- NEW: The agent's prime Directive ---
+    # We give the Agent a strict presonality so it stops asking for permission!
+    system_instruction = SystemMessage(content="""
+        You are an elite Enterprise AI Routing agent.
+        You have access to the 'search_company_documents' tool.
+        CRITICAL RULE: If the user uses the words "documents" , "PDF", "files", "summary", or asks about internal data, you MUST instantly call the 'search_company_documents' tool.
+        DO NOT ask the user to clarify which documents. DO NOT ask for more details. Just exectue the tool!
+    """)
+
+    # Combine the strict instruction with the user's chat history
+    agent_messages = [system_instruction] + list(messages)
+
+    # call the llm with the bound tools
+
+    response = await llm_with_tools.ainvoke(agent_messages)
+
+    # -----------  Defensive Parsing for the Gemma ----
+    raw_content = response.content 
+    if isinstance(raw_content, list):
+        # Extract the text string out of  the list safely
+        final_text = str(raw_content[0].get('text',''))
+    else:
+        final_text = str(raw_content)
+
+    # Save the message history and the raw generation text
+    return {"messages":[response], "generation": str(final_text)}
+
+
+# ------------- Tool Node route function -----------
+def route_after_agent(state) -> str:
+    """
+    Look at the last message from the LLM.
+    If the LLM requested a tool call, route to 'tools'.
+    Otherwise, route to the 'generator' (or finish)
+    """
+
+    last_message = state['messages'][-1]
+
+    # Check if the LLM output contains any tool calls
+    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        print(f" [ROUTER] Agent requested a tool execution: {last_message.tool_calls[0]['name']}")
+        tool_name = last_message.tool_calls[0]['name']
+
+        if tool_name == "search_company_documents":
+            print(" [ROUTER] Agent wants to search documents. Routing to Phase 1 RAG Pipeline.")
+            return 'retrieve' # This triggers your custom MongoDB search!
+        else:
+            print(f"[ROUTER]: Agent requested a python tool:{tool_name}")
+            return "tools"
+    
+    print(f" [ROUTER] No tool calls requested. Routing to final Generator.")
+    return 'end'
 
 # ========================================================
 #                   BUILD THE LANGGRAPH WORKFLOW
@@ -545,13 +620,33 @@ def decide_to_generate(state: GraphState)-> str:
 workflow = StateGraph(GraphState)
 
 # 2. Define the "Nodes" (The Physical funtions the AI can execute)
-workflow.add_node("retrieve", retriever_node) # fetches from MongoDB
-workflow.add_node('grade_documents', grade_node) # checks if docs are relevant 
-workflow.add_node("generate", generate_node) #Streams the final answer
-workflow.add_node("rewrite_query", rewrite_node) # Improves the seach query
+workflow.add_node('agent', agent_node) #  # NEW : The front door # PHASE 2 tools calling
+workflow.add_node("retrieve", retriever_node) # fetches from MongoDB # PHASE 1 RAG
+workflow.add_node('grade_documents', grade_node) # checks if docs are relevant  # PHASE 1 RAG
+workflow.add_node("generate", generate_node) #Streams the final answer #PHASE 1 RAG
+workflow.add_node("rewrite_query", rewrite_node) # Improves the seach query #PHASE 1 RAG
+workflow.add_node('tools', tool_node) # Add the tools Node to your graph architecture #PHASE 2 Tools
 
 # 3. Define the "Edges" (How the AI moves from node to node)
-workflow.set_entry_point("retrieve")
+# workflow.set_entry_point("retrieve") #Phase 1 entery point is the retriever node
+workflow.set_entry_point("agent") #Phase 2 Entry point is the agent decides what happens first
+
+# The agent router
+workflow.add_conditional_edges(
+    "agent",
+    route_after_agent,
+    {
+        "tools": "tools", # Go to the ToolNode
+        "retrieve": "retrieve", # Go to the RAG pipeline
+        "end":END # Finish the conversation
+    }
+)
+
+# Tool loop
+workflow.add_edge("tools", "agent") # After a python tool runs, ALWAYS go back to the agent! 
+
+
+# -------------- EXISTING PHASE 1 RAG LOOP (Untouched and perfect!)
 workflow.add_edge("retrieve", "grade_documents")
 
 # 4. The conditional Edge (The "Thinking" Phase)
@@ -740,7 +835,8 @@ async def chat_with_documents(request: ChatRequest, current_user: dict = Depends
                 "question": request.question,
                 "loop_count":0,
                 "allowed_tiers": allowed_tiers,
-                "session_id":request.session_id # Injected here!,
+                "session_id":request.session_id, # Injected here!,
+                "messages": [HumanMessage(content=request.question)] # 🎯 THE FIX: Seed the state with the Human Message!
 
             })
 
