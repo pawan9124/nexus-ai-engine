@@ -16,9 +16,10 @@ from pymongo import MongoClient
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 from langgraph.prebuilt import ToolNode
-from tools import check_billing_status, search_company_documents
+from tools import check_billing_status, search_company_documents, issue_customer_refund
 from langchain_core.messages import  BaseMessage, HumanMessage, SystemMessage 
 from langgraph.graph.message import add_messages
+from langgraph.checkpoint.memory import MemorySaver
 from typing import Dict,Any, List, TypedDict, Annotated, Sequence
 import shutil
 import os
@@ -68,8 +69,17 @@ llm = ChatGoogleGenerativeAI(model='gemini-2.5-flash', temperature=0)
 
 # ------------ BINDING FUNCTION TOOLS ----------------
 # For the agent_node we are not passing the search_company_documents to the tool node cause we want the RAG flow to already handle the retrieval of the documents and we want the RAG flow to execute when need to search the documents 
-llm_with_tools = llm.bind_tools([check_billing_status, search_company_documents]) # This bind_tools with llm tell the llm or gemini that these tools exsit in our flow and you can 
-tool_node = ToolNode([check_billing_status]) # This one is used when the lang graph get the request from the llm to use it and then it has to use it.
+llm_with_tools = llm.bind_tools([
+    check_billing_status, 
+    search_company_documents, 
+    issue_customer_refund
+    ]) # This bind_tools with llm tell the llm or gemini that these tools exsit in our flow and you can 
+
+# Node 1: Safe tools that execute instantly
+safe_tool_node = ToolNode([check_billing_status]) # This one is used when the lang graph get the request from the llm to use it and then it has to use it.
+
+# Node 2: Dangerous tools that require a manager's approval
+sensitive_tool_node = ToolNode([issue_customer_refund])
 
 # THE 2026 UPGRADE: Using the official LangCHain MongoDB vector Store abstraction 
 # This will replace the $vector Search we are introducing before
@@ -100,6 +110,10 @@ class GradeDocuments(BaseModel):
     Binary score for relevance checks on retrieved documents.
     """
     binary_score: str = Field(description="Documents are relevant to the question, 'yes' or 'no'")
+
+class ApprovalRequest(BaseModel):
+    session_id:str
+    approved:bool
 
 
 
@@ -606,6 +620,9 @@ def route_after_agent(state) -> str:
         if tool_name == "search_company_documents":
             print(" [ROUTER] Agent wants to search documents. Routing to Phase 1 RAG Pipeline.")
             return 'retrieve' # This triggers your custom MongoDB search!
+        elif tool_name == "issue_customer_refund":
+            print(" [ROUTER]: Agent requested a SENSITIVE tool. Routing to Quarantine.")
+            return "sensitive_tools" # Route to the new dangerous node
         else:
             print(f"[ROUTER]: Agent requested a python tool:{tool_name}")
             return "tools"
@@ -619,13 +636,17 @@ def route_after_agent(state) -> str:
 # 1. Initialize the Graph with out State
 workflow = StateGraph(GraphState)
 
+# 2. Initialize short-term memory so  the graph can 'pause'pass
+memory = MemorySaver()
+
 # 2. Define the "Nodes" (The Physical funtions the AI can execute)
 workflow.add_node('agent', agent_node) #  # NEW : The front door # PHASE 2 tools calling
 workflow.add_node("retrieve", retriever_node) # fetches from MongoDB # PHASE 1 RAG
 workflow.add_node('grade_documents', grade_node) # checks if docs are relevant  # PHASE 1 RAG
 workflow.add_node("generate", generate_node) #Streams the final answer #PHASE 1 RAG
 workflow.add_node("rewrite_query", rewrite_node) # Improves the seach query #PHASE 1 RAG
-workflow.add_node('tools', tool_node) # Add the tools Node to your graph architecture #PHASE 2 Tools
+workflow.add_node('safe_tools', safe_tool_node) # Add the tools Node to your graph architecture #PHASE 2 Tools
+workflow.add_node("sensitive_tools", sensitive_tool_node)
 
 # 3. Define the "Edges" (How the AI moves from node to node)
 # workflow.set_entry_point("retrieve") #Phase 1 entery point is the retriever node
@@ -636,14 +657,17 @@ workflow.add_conditional_edges(
     "agent",
     route_after_agent,
     {
-        "tools": "tools", # Go to the ToolNode
-        "retrieve": "retrieve", # Go to the RAG pipeline
+        "safe_tools": "safe_tools", # Go to the ToolNode
+        "sensitive_tools":"sensitive_tools", # For the human review
+        "retrieve": "retrieve", # Go to the RAG pipeline,
         "end":END # Finish the conversation
     }
 )
 
 # Tool loop
-workflow.add_edge("tools", "agent") # After a python tool runs, ALWAYS go back to the agent! 
+workflow.add_edge("safe_tools", "agent") # After a python tool runs, ALWAYS go back to the agent! 
+workflow.add_edge("sensitive_tools", "agent") # After a sensitive tool is approved by human, go back to the agent
+
 
 
 # -------------- EXISTING PHASE 1 RAG LOOP (Untouched and perfect!)
@@ -666,7 +690,10 @@ workflow.add_edge("rewrite_query", "retrieve")
 workflow.add_edge("generate", END)
 
 # Compile the Graph!
-app_brain  = workflow.compile()
+app_brain  = workflow.compile(
+    checkpointer=memory,
+    interrupt_before=["sensitive_tools"]
+)
 
 
 # Mock Authentication Dependendcy
@@ -830,6 +857,9 @@ async def chat_with_documents(request: ChatRequest, current_user: dict = Depends
             #  THE NEW AGENTIC BRAIN (RAG) vs STANDARD LLM
             # ==================================================
             print(f" Routing question to LangGraph Agentic Brain...")
+
+            # New addition of the phase 3: Human in the loop saving the graph in the memory for pause and retrieval of the graph
+            config = {"configurable":{'thread_id':request.session_id}}
         
             final_state = await app_brain.ainvoke({
                 "question": request.question,
@@ -838,7 +868,20 @@ async def chat_with_documents(request: ChatRequest, current_user: dict = Depends
                 "session_id":request.session_id, # Injected here!,
                 "messages": [HumanMessage(content=request.question)] # 🎯 THE FIX: Seed the state with the Human Message!
 
-            })
+            }, config=config) # Pass down the config there
+
+            # ----------------- HUMAN-IN-THE-LOOP INTERUPT CHECK ------
+            # we must check if the graph completed or if it hit the emergency brake
+            graph_run_info = await app_brain.aget_state(config)
+
+            if graph_run_info.next:
+                # If next is not empty, it means the graph paused before a node!
+                print(f" [HITL ALERT] Graph paused before node: {graph_run_info.next} ")
+
+                async def stream_paused_message():
+                    yield " [MANAGER APPROVAL REQUIRED]: Your request to issue a customer refund has been queued. A system administrator must review and approve this transaction before processing continues. "
+
+                return StreamingResponse(stream_paused_message(), media_type='text/event-stream')
 
             final_answer = final_state.get("generation", "I'm sorry, I couldn't find an answer.")
 
@@ -959,6 +1002,34 @@ async def get_session_history(session_id:str):
 
     except Exception as e:
         print("error",e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post('/api/approve')
+async def approve_sensitive_action(request: ApprovalRequest):
+    try:
+        config = {"configurable": {"thread_id":request.session_id}}
+
+        # 1. Fetch the frozen state using the session_id stub
+        current_state = await app_brain.aget_state(config)
+
+        if not current_state:
+            raise HTTPException(status_code=400, detail="No paused transaction found for this session")
+        
+        if request.approved:
+            print(f" [HITL] Manager APPROVED the transaction. Resuming the grahp...")
+
+            #None tells LangGraph to continue past the interrupt point with no changes
+            resume_state = await app_brain.ainvoke(None, config=config)
+
+            final_answer = resume_state.get("generation", "Action processed successfully")
+            return {'status': 'completed', 'message': final_answer}
+        else:
+            print(f" [HITL]: Mananger REJECTED teh transaction. Wiping the state request")
+
+            # You could update the state to  say "REJECTED" or leave it to stop
+            await app_brain.aupdate_state(config, {"generation":"Transaction Rejected by Manager."}, as_node="agent")
+            return {"status": "rejected", "message": "Transaction was denined by  management"}
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 

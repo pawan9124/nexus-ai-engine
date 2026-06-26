@@ -25,3 +25,12 @@ def search_company_documents(query: str):
     Use this tool to search the company's internal MongoDB documents database for system design, metaverse or any uploaded PDFs.
     """
     pass # we don't write code here. LangGraph will intercept this call!
+
+@tool
+def issue_customer_refund(account_id:str, amount:int) -> str:
+    """
+    CRITICAL: Use this tool to issue monetary refund to a customre.
+    This is highly sensitve action.
+    """
+    print(f" [DANGEROUS TOOL EXECUTING] Issuing ${amount} refund to {account_id}...")
+    return f"Success: ${amount} has been refunded to {account_id}"
