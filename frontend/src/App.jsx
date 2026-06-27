@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import axios from 'axios';
 import { UploadCloud, MessageSquare, Send, Loader2, PlusCircle, MessageCircle, LogOut } from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
 
 function App() {
   const [file, setFile] = useState(null);
@@ -371,7 +372,9 @@ function App() {
                     ? 'bg-indigo-600 text-white rounded-2xl rounded-tr-sm shadow-md'
                     : 'bg-white/5 text-slate-200 rounded-2xl rounded-tl-sm border border-white/5'
                     }`}>
-                    {msg.text}
+                    <div className="message-bubble">
+                      <ReactMarkdown>{msg.text}</ReactMarkdown>
+                    </div>
                   </div>
                 </div>
               ))

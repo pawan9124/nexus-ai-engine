@@ -860,39 +860,91 @@ async def chat_with_documents(request: ChatRequest, current_user: dict = Depends
 
             # New addition of the phase 3: Human in the loop saving the graph in the memory for pause and retrieval of the graph
             config = {"configurable":{'thread_id':request.session_id}}
-        
-            final_state = await app_brain.ainvoke({
-                "question": request.question,
-                "loop_count":0,
-                "allowed_tiers": allowed_tiers,
-                "session_id":request.session_id, # Injected here!,
-                "messages": [HumanMessage(content=request.question)] # 🎯 THE FIX: Seed the state with the Human Message!
 
-            }, config=config) # Pass down the config there
+            # =========================== INTRODUCING THE STATE UPDATE OF THE AI BRAIN TO THE UI ================
+            async def stream_graph_thoughts():
+                #1 . Yield an immediate response so the UI feels instant
+                yield "\nAgent is analyzing your response ...*\n\n"
+
+                # 2. Stream the graph's progres node-by-node
+                async for step_update in  app_brain.astream({
+                    "question": request.question,
+                    "loop_count": 0,
+                    "allowed_tiers": allowed_tiers,
+                    "session_id": request.session_id,
+                    "messages": [HumanMessage(content=request.question)]
+                }, config=config, stream_mode="updates"):
+
+                    # "step_updates" tells us which node just finished
+                    for node_name, node_stats in step_update.items():
+                        if node_name == "agent":
+                            yield " \n\n*Agent formulated a plan ...*\n\n"
+                        elif node_name == 'retrieve':
+                            yield " *Searching secure corporate database....*\n\n"
+                        elif node_name == 'grade_documents':
+                            yield ' *Grading retrieved documents for relevance...*\n\n'
+                        elif node_name == 'rewrite_query':
+                            yield ' *Documents were insufficient. Rewriting query ...*\n\n'
+                        elif node_name == "safe_tools":
+                            yield " *Fetching live data from internal systems. ..*\n\n"
+
+
+            # old way to handle the human loop state
+            # final_state = await app_brain.ainvoke({
+            #     "question": request.question,
+            #     "loop_count":0,
+            #     "allowed_tiers": allowed_tiers,
+            #     "session_id":request.session_id, # Injected here!,
+            #     "messages": [HumanMessage(content=request.question)] # 🎯 THE FIX: Seed the state with the Human Message!
+
+            # }, config=config) # Pass down the config there
 
             # ----------------- HUMAN-IN-THE-LOOP INTERUPT CHECK ------
             # we must check if the graph completed or if it hit the emergency brake
-            graph_run_info = await app_brain.aget_state(config)
+            # graph_run_info = await app_brain.aget_state(config)
 
-            if graph_run_info.next:
-                # If next is not empty, it means the graph paused before a node!
-                print(f" [HITL ALERT] Graph paused before node: {graph_run_info.next} ")
+            
 
-                async def stream_paused_message():
-                    yield " [MANAGER APPROVAL REQUIRED]: Your request to issue a customer refund has been queued. A system administrator must review and approve this transaction before processing continues. "
+            # Happy path: Yield the final generation
+            # if graph_run_info.next:
+            #     # If next is not empty, it means the graph paused before a node!
+            #     print(f" [HITL ALERT] Graph paused before node: {graph_run_info.next} ")
 
-                return StreamingResponse(stream_paused_message(), media_type='text/event-stream')
+            #     async def stream_paused_message():
+            #         yield " [MANAGER APPROVAL REQUIRED]: Your request to issue a customer refund has been queued. A system administrator must review and approve this transaction before processing continues. "
 
-            final_answer = final_state.get("generation", "I'm sorry, I couldn't find an answer.")
+            #     return StreamingResponse(stream_paused_message(), media_type='text/event-stream')
 
-            async def stream_graph_response():
-                # Yield the final answer for the frontend
-                yield final_answer
-                # Save to history
+            # final_answer = final_state.get("generation", "I'm sorry, I couldn't find an answer.")
+
+            # async def stream_graph_response():
+            #     # Yield the final answer for the frontend
+            #     yield final_answer
+            #     # Save to history
+            #     chat_history.add_user_message(request.question)
+            #     chat_history.add_ai_message(final_answer)
+
+                # return StreamingResponse(stream_graph_response(), media_type="text/event-stream")
+
+                final_state = await app_brain.aget_state(config)
+
+                # Check if it hit the Emergency Brake (HITL)
+                if final_state.next:
+                    yield "\n **[MANAGER APPROVAL REQUIRED]: ** Your request to execute a sensitive action has been queued. A system administrator must review and approve this transaction ."
+                    return # Stop Streaming
+                
+                # Happy path: Yield the final generation
+                final_answer = final_state.values.get('generation', "I'm sorry, I couldn't find an answer")
+                yield f"\n\n** Final Answer:**\n{final_answer}"
+
+                # Save to MongodDB chat history
                 chat_history.add_user_message(request.question)
                 chat_history.add_ai_message(final_answer)
 
-            return StreamingResponse(stream_graph_response(), media_type="text/event-stream")
+            # Return the async generator as a StreamingResponse
+            return StreamingResponse(stream_graph_thoughts(), media_type="text/event-stream")
+
+
             # ============= OLD WAY TO HANDLE THE  RAG ==========
             # # Only hit the vector database if explicitly routed here!
             # retriever = vector_store.as_retriever(
