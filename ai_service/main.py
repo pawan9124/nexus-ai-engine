@@ -16,7 +16,7 @@ from pymongo import MongoClient
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 from langgraph.prebuilt import ToolNode
-from tools import check_billing_status, search_company_documents, issue_customer_refund
+from tools import check_billing_status, search_company_documents, issue_customer_refund, get_live_weather
 from langchain_core.messages import  BaseMessage, HumanMessage, SystemMessage 
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
@@ -72,11 +72,12 @@ llm = ChatGoogleGenerativeAI(model='gemini-2.5-flash', temperature=0)
 llm_with_tools = llm.bind_tools([
     check_billing_status, 
     search_company_documents, 
-    issue_customer_refund
+    issue_customer_refund,
+    get_live_weather
     ]) # This bind_tools with llm tell the llm or gemini that these tools exsit in our flow and you can 
 
 # Node 1: Safe tools that execute instantly
-safe_tool_node = ToolNode([check_billing_status]) # This one is used when the lang graph get the request from the llm to use it and then it has to use it.
+safe_tool_node = ToolNode([check_billing_status, get_live_weather]) # This one is used when the lang graph get the request from the llm to use it and then it has to use it.
 
 # Node 2: Dangerous tools that require a manager's approval
 sensitive_tool_node = ToolNode([issue_customer_refund])
@@ -577,10 +578,19 @@ async def agent_node(state:GraphState) -> GraphState:
     # ---- NEW: The agent's prime Directive ---
     # We give the Agent a strict presonality so it stops asking for permission!
     system_instruction = SystemMessage(content="""
-        You are an elite Enterprise AI Routing agent.
-        You have access to the 'search_company_documents' tool.
-        CRITICAL RULE: If the user uses the words "documents" , "PDF", "files", "summary", or asks about internal data, you MUST instantly call the 'search_company_documents' tool.
-        DO NOT ask the user to clarify which documents. DO NOT ask for more details. Just exectue the tool!
+        You are a  highly capable Enterprise AI Assistant.
+        You have access to  a suite of tools to help the user.
+
+        CRITICAL INSTRUCTIONS:
+        1. If the user asks about billing, use the check_billing_status tool.
+        2. If the user asks for a refund, use the issue_customer_refund tool.
+        3. If the user asks about the weather, DO NOT REFUSE. You have a get_live_weather tool.
+            Use the general knwoledge to esitmate the latitude and longitude  of the requested city and execute the tool.
+        4. You have access to the 'search_company_documents' tool.
+            CRITICAL RULE: If the user uses the words "documents" , "PDF", "files", "summary", or asks about internal data, you MUST instantly call the 'search_company_documents' tool.
+            DO NOT ask the user to clarify which documents. DO NOT ask for more details. Just exectue the tool!
+
+        Never say 'I am an AI and do not have access to real-time data.' Use your tools!
     """)
 
     # Combine the strict instruction with the user's chat history
@@ -625,7 +635,7 @@ def route_after_agent(state) -> str:
             return "sensitive_tools" # Route to the new dangerous node
         else:
             print(f"[ROUTER]: Agent requested a python tool:{tool_name}")
-            return "tools"
+            return "safe_tools"
     
     print(f" [ROUTER] No tool calls requested. Routing to final Generator.")
     return 'end'

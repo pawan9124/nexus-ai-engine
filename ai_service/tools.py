@@ -1,3 +1,4 @@
+import requests
 from langchain_core.tools import tool
 
 @tool
@@ -34,3 +35,28 @@ def issue_customer_refund(account_id:str, amount:int) -> str:
     """
     print(f" [DANGEROUS TOOL EXECUTING] Issuing ${amount} refund to {account_id}...")
     return f"Success: ${amount} has been refunded to {account_id}"
+
+@tool 
+def get_live_weather(latitude:float, longitude:float) -> str:
+    """
+    Fetches the current real-world weather temperature for a specific location.
+    You must provide the latitude and longitude as floats. Use you general knowledge to estimate the coordinates for the requsted city.
+    """
+
+    print(f" [LIVE API CALL] Fetching weather for lat:{latitude}&longitude={longitude}...")
+
+    url =  f'https://api.open-meteo.com/v1/forecast?latitude={latitude}&longitude={longitude}&current_weather=true'
+
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+
+        current_temp = data['current_weather']['temperature']
+        wind_speed = data['current_weather']['windspeed']
+
+        return  f"The current temperature is {current_temp}*C with a wind speed of {wind_speed}km/h."
+    except Exception as e:
+        return f"Failed to fetch live weather data: {str(e)}"
+
+
